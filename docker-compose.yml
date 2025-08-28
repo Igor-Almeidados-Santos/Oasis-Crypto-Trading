@@ -1,0 +1,308 @@
+version: '3.8'
+
+# Oasis Crypto Trade - Infrastructure Services
+# Production-ready setup with enterprise-grade configurations
+
+networks:
+  oasis-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  oasis_postgres_data:
+    driver: local
+  oasis_redis_data:
+    driver: local
+  oasis_kafka_data:
+    driver: local
+  oasis_zookeeper_data:
+    driver: local
+  oasis_prometheus_data:
+    driver: local
+  oasis_grafana_data:
+    driver: local
+
+services:
+  # =============================================================================
+  # DATABASE LAYER - PostgreSQL with TimescaleDB
+  # =============================================================================
+  oasis-postgres:
+    image: timescale/timescaledb:latest-pg15
+    container_name: oasis-postgres
+    hostname: oasis-postgres
+    environment:
+      POSTGRES_DB: oasis_trading_db
+      POSTGRES_USER: oasis_admin
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-oasis_secure_2024}
+      TIMESCALEDB_TELEMETRY: off
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - oasis_postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d
+      - ./infra/postgres/conf/postgresql.conf:/etc/postgresql/postgresql.conf
+    ports:
+      - "5432:5432"
+    networks:
+      oasis-network:
+        ipv4_address: 172.20.0.10
+    command: >
+      postgres -c config_file=/etc/postgresql/postgresql.conf
+      -c log_statement=all
+      -c log_destination=stderr
+      -c logging_collector=on
+      -c log_filename='postgresql-%Y-%m-%d_%H%M%S.log'
+      -c log_rotation_size=100MB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oasis_admin -d oasis_trading_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # =============================================================================
+  # CACHE LAYER - Redis Enterprise Features
+  # =============================================================================
+  oasis-redis:
+    image: redis/redis-stack:7.2.0-v6
+    container_name: oasis-redis
+    hostname: oasis-redis
+    environment:
+      REDIS_ARGS: >
+        --requirepass ${REDIS_PASSWORD:-oasis_redis_2024}
+        --appendonly yes
+        --appendfsync everysec
+        --auto-aof-rewrite-percentage 100
+        --auto-aof-rewrite-min-size 64mb
+        --maxmemory 2gb
+        --maxmemory-policy allkeys-lru
+        --timeout 300
+        --tcp-keepalive 300
+    volumes:
+      - oasis_redis_data:/data
+      - ./infra/redis/redis.conf:/usr/local/etc/redis/redis.conf
+    ports:
+      - "6379:6379"
+      - "8001:8001"  # RedisInsight
+    networks:
+      oasis-network:
+        ipv4_address: 172.20.0.11
+    command: redis-server /usr/local/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # =============================================================================
+  # MESSAGE STREAMING - Apache Kafka with Schema Registry
+  # =============================================================================
+  oasis-zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: oasis-zookeeper
+    hostname: oasis-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_SYNC_LIMIT: 2
+      ZOOKEEPER_INIT_LIMIT: 5
+      ZOOKEEPER_MAX_CLIENT_CNXNS: 0
+      ZOOKEEPER_AUTOPURGE_SNAP_RETAIN_COUNT: 10
+      ZOOKEEPER_AUTOPURGE_PURGE_INTERVAL: 1
+    volumes:
+      - oasis_zookeeper_data:/var/lib/zookeeper/data
+      - ./infra/zookeeper/logs:/var/lib/zookeeper/log
+    ports:
+      - "2181:2181"
+    networks:
+      oasis-network:
+        ipv4_address: 172.20.0.12
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  oasis-kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: oasis-kafka
+    hostname: oasis-kafka
+    depends_on:
+      oasis-zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: oasis-zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://oasis-kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+      KAFKA_NUM_PARTITIONS: 8
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
+      KAFKA_MESSAGE_MAX_BYTES: 10485760
+      KAFKA_REPLICA_FETCH_MAX_BYTES: 10485760
+    volumes:
+      - oasis_kafka_data:/var/lib/kafka/data
+      - ./infra/kafka/logs:/var/log/kafka
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    networks:
+      oasis-network:
+        ipv4_address: 172.20.0.13
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+  oasis-schema-registry:
+    image: confluentinc/cp-schema-registry:7.5.0
+    container_name: oasis-schema-registry
+    hostname: oasis-schema-registry
+    depends_on:
+      oasis-kafka:
+        condition: service_healthy
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: oasis-schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: oasis-kafka:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: backward
+      SCHEMA_REGISTRY_LOG4J_ROOT_LOGLEVEL: INFO
+    ports:
+      - "8081:8081"
+    networks:
+      oasis-network:
+        ipv4_address: 172.20.0.14
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/subjects"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+  # =============================================================================
+  # MONITORING STACK - Prometheus & Grafana
+  # =============================================================================
+  oasis-prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: oasis-prometheus
+    hostname: oasis-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+      - '--storage.tsdb.retention.size=10GB'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+    volumes:
+      - oasis_prometheus_data:/prometheus
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./infra/prometheus/rules:/etc/prometheus/rules
+    ports:
+      - "9090:9090"
+    networks:
+      oasis-network:
+        ipv4_address: 172.20.0.15
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  oasis-grafana:
+    image: grafana/grafana:10.2.2
+    container_name: oasis-grafana
+    hostname: oasis-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-oasis_admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-oasis_grafana_2024}
+      GF_USERS_ALLOW_SIGN_UP: false
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource,grafana-worldmap-panel
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/oasis-overview.json
+    volumes:
+      - oasis_grafana_data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards
+    ports:
+      - "3000:3000"
+    networks:
+      oasis-network:
+        ipv4_address: 172.20.0.16
+    depends_on:
+      - oasis-prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  # =============================================================================
+  # DEVELOPMENT UTILITIES
+  # =============================================================================
+  oasis-adminer:
+    image: adminer:4.8.1
+    container_name: oasis-adminer
+    hostname: oasis-adminer
+    environment:
+      ADMINER_DEFAULT_SERVER: oasis-postgres
+      ADMINER_DESIGN: pepa-linha-dark
+    ports:
+      - "8080:8080"
+    networks:
+      oasis-network:
+        ipv4_address: 172.20.0.20
+    depends_on:
+      - oasis-postgres
+    restart: unless-stopped
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.1
+    container_name: oasis-kafka-ui
+    hostname: oasis-kafka-ui
+    environment:
+      KAFKA_CLUSTERS_0_NAME: oasis-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: oasis-kafka:29092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://oasis-schema-registry:8081
+      DYNAMIC_CONFIG_ENABLED: 'true'
+      SERVER_PORT: 8082
+    ports:
+      - "8082:8082"
+    networks:
+      oasis-network:
+        ipv4_address: 172.20.0.21
+    depends_on:
+      - oasis-kafka
+      - oasis-schema-registry
+    restart: unless-stopped
+
+# =============================================================================
+# HEALTHCHECK MONITORING
+# =============================================================================
+x-healthcheck-config: &healthcheck-config
+  interval: 30s
+  timeout: 10s
+  retries: 3
+  start_period: 30s
